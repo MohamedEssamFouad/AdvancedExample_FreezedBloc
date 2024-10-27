@@ -1,116 +1,125 @@
 import 'dart:async';
 import 'dart:io';
-
+import 'dart:typed_data';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:image/image.dart' as img;
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:sqflite/sqflite.dart';
-import 'package:http/http.dart' as http;
-
+import '../../db.dart';
 import 'image_bloc.dart';
 
 class ImageBloc extends Bloc<ImageEvent, ImageState> {
-  late Database database;
+  final DatabaseService _databaseService;
   final Connectivity _connectivity;
   late StreamSubscription<ConnectivityResult> _connectivitySubscription;
   bool isConnected = false;
 
-  ImageBloc()
+  ImageBloc(this._databaseService)
       : _connectivity = Connectivity(),
         super(const ImageState.initial()) {
+    _registerEventHandlers();
+    _initialize();
+  }
+
+  void _registerEventHandlers() {
     on<StoreImage>(_onStoreImage);
     on<LoadImages>(_onLoadImages);
     on<UploadPendingImages>(_onUploadPendingImages);
     on<ConnectivityChanged>(_onConnectivityChanged);
-
-    _initialize();
   }
 
   Future<void> _initialize() async {
-    await _initDatabase();
     _initializeConnectivitySubscription();
-  }
-
-  Future<void> _initDatabase() async {
-    final directory = await getApplicationDocumentsDirectory();
-    final path = join(directory.path, 'images.db');
-    database = await openDatabase(
-      path,
-      version: 3,
-      onCreate: (db, version) {
-        return db.execute(
-          'CREATE TABLE images(id INTEGER PRIMARY KEY, path TEXT, uploaded INTEGER)',
-        );
-      },
-    );
-    print('Database initialized at path: $path');
     add(const ImageEvent.loadImages());
   }
 
   void _initializeConnectivitySubscription() {
-    _connectivitySubscription =
-        _connectivity.onConnectivityChanged.listen((result) {
-          add(ImageEvent.connectivityChanged(result));
-        });
+    // Listen to connectivity
+    _connectivitySubscription = _connectivity.onConnectivityChanged.listen(
+          (result) => add(ImageEvent.connectivityChanged(result)),
+    );
     print('Connectivity subscription initialized.');
   }
 
-  Future<void> _onStoreImage(
-      StoreImage event, Emitter<ImageState> emit) async {
+  Future<void> _onStoreImage(StoreImage event, Emitter<ImageState> emit) async {
+    emit(const ImageState.loading());
     try {
-      emit(const ImageState.loading());
-      final directory = await getApplicationDocumentsDirectory();
-      final path =
-      join(directory.path, '${DateTime.now().millisecondsSinceEpoch}.png');
-      await event.image.copy(path);
-      await database.insert('images', {'path': path, 'uploaded': 0});
-      print('Image stored locally at $path with uploaded status 0.');
-      add(const ImageEvent.loadImages());
+      final compressedFile = await _compressAndSaveImage(event.image);
+      print('Image compressed and saved at ${compressedFile.path}');
+
       if (isConnected) {
-        add(const ImageEvent.uploadPendingImages());
+        final uploadSuccess = await _uploadImage(compressedFile);
+        if (!uploadSuccess) { //when error happen
+          await _databaseService.insertImage(compressedFile.path);
+          print('Failed to upload image; stored locally at ${compressedFile.path}');
+        } else {
+          print('Image uploaded successfully.');
+        }
+      } else {  //when offline
+        await _databaseService.insertImage(compressedFile.path);
+        print('Stored image locally at ${compressedFile.path} (offline)');
       }
+
+      add(const ImageEvent.loadImages());
     } catch (e) {
-      print('Failed to store image: $e');
+      print('Failed to store or upload image: $e');
       emit(ImageState.error(e.toString()));
     }
   }
 
-  Future<void> _onLoadImages(
-      LoadImages event, Emitter<ImageState> emit) async {
-    final List<Map<String, dynamic>> images = await database.query('images');
+  Future<File> _compressAndSaveImage(File imageFile) async {
+    // Read the image file as bytes
+    final imageBytes = await imageFile.readAsBytes();
+    final image = img.decodeImage(imageBytes);
+
+    final resizedImage = img.copyResize(image!, width: 800);
+    final compressedBytes = img.encodeJpg(resizedImage, quality: 70);
+
+    // Save compressed image to a temporary file
+    final directory = await getApplicationDocumentsDirectory();
+    final path = join(directory.path, '${DateTime.now().millisecondsSinceEpoch}_compressed.jpg'); //to generates a unique number
+    final compressedFile = File(path);
+    await compressedFile.writeAsBytes(Uint8List.fromList(compressedBytes));
+    print('Compressed image saved at: $path');
+    return compressedFile;
+  }
+
+  Future<void> _onLoadImages(LoadImages event, Emitter<ImageState> emit) async {
+    // Load all images from the database and emit them
+    final images = await _databaseService.getAllImages();
     final imagePaths = images.map((image) => image['path'] as String).toList();
-    print('Loaded images from database: ${imagePaths.length} images found.');
+    print('Loaded ${imagePaths.length} images from database.');
     emit(ImageState.loaded(imagePaths));
   }
 
-  Future<void> _onUploadPendingImages(
-      UploadPendingImages event, Emitter<ImageState> emit) async {
-    final List<Map<String, dynamic>> images =
-    await database.query('images', where: 'uploaded = ?', whereArgs: [0]);
-    print('${images.length} pending images to upload.');
+  Future<void> _onUploadPendingImages(UploadPendingImages event, Emitter<ImageState> emit) async {
+    // Retrieve all images marked as not uploaded (uploaded = 0)
+    final pendingImages = await _databaseService.getPendingImages();
+    print('Found ${pendingImages.length} pending images to upload.');
 
-    for (var image in images) {
+    for (var image in pendingImages) {
       final file = File(image['path']);
       final uploaded = await _uploadImage(file);
       if (uploaded) {
-        await database.update('images', {'uploaded': 1},
-            where: 'id = ?', whereArgs: [image['id']]);
-        print(
-            'Image at ${image['path']} uploaded successfully and status updated to 1.');
+        await _databaseService.updateImageStatus(image['id'], 1); // Update status to uploaded
+        print('Uploaded image at ${image['path']} successfully and updated status to 1.');
       } else {
         print('Failed to upload image at ${image['path']}, status remains 0.');
       }
     }
+      ///////trigger it
     add(const ImageEvent.loadImages());
   }
 
-  void _onConnectivityChanged(
-      ConnectivityChanged event, Emitter<ImageState> emit) {
-    isConnected = event.result == ConnectivityResult.mobile ||
-        event.result == ConnectivityResult.wifi;
+  void _onConnectivityChanged(ConnectivityChanged event, Emitter<ImageState> emit) {
+    // Update connectivity
+    isConnected = event.result == ConnectivityResult.mobile || event.result == ConnectivityResult.wifi;
     print('Connectivity changed: ${isConnected ? "Connected" : "Not Connected"}');
     emit(ImageState.connectivity(isConnected));
+
+    // If online, attempt to upload pending images
     if (isConnected) {
       add(const ImageEvent.uploadPendingImages());
     }
@@ -128,8 +137,7 @@ class ImageBloc extends Bloc<ImageEvent, ImageState> {
         return true;
       } else {
         print('Server response: Failed with status ${response.statusCode} for ${image.path}');
-        throw HttpException(
-            'Failed to upload image, server responded with ${response.statusCode}');
+        return false;
       }
     } catch (e) {
       print('An error occurred while uploading image: $e');
@@ -139,6 +147,7 @@ class ImageBloc extends Bloc<ImageEvent, ImageState> {
 
   @override
   Future<void> close() {
+    // Cancel connectivity subscription when Bloc is closed
     _connectivitySubscription.cancel();
     print('Connectivity subscription cancelled.');
     return super.close();

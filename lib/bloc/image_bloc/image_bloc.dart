@@ -7,7 +7,6 @@ import 'package:freezed_annotation/freezed_annotation.dart';
 
 part 'image_bloc.freezed.dart';
 
-// Events
 @freezed
 class ImageEvent with _$ImageEvent {
   const factory ImageEvent.storeImage(File image) = StoreImage;
@@ -16,7 +15,6 @@ class ImageEvent with _$ImageEvent {
   const factory ImageEvent.connectivityChanged(ConnectivityResult result) = ConnectivityChanged;
 }
 
-// States
 @freezed
 class ImageState with _$ImageState {
   const factory ImageState.initial() = _Initial;
